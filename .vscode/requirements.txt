@@ -1,0 +1,2 @@
+# No third-party dependencies required.
+# This project uses Python's standard library only.

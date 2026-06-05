@@ -1,4 +1,5 @@
 import os
+import stat
 import hashlib
 import shutil
 import json
@@ -8,15 +9,14 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from pathlib import Path
-from datetime import datetime
 from collections import defaultdict
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v',
                     '.mpg', '.mpeg', '.flv', '.ts', '.vob', '.divx', '.webm'}
 
-BACKUP_DIR = Path.home() / "MovieDuplicateBackup"
+BACKUP_DIR  = Path.home() / "MovieDuplicateBackup"
 CONFIG_FILE = Path.home() / ".movie_scanner_config.json"
-LOG_FILE = Path.home() / "movie_scanner.log"
+LOG_FILE    = Path.home() / "movie_scanner.log"
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 
@@ -27,7 +27,59 @@ logging.basicConfig(
 )
 
 
-# ── Config (stores TMDB token) ───────────────────────────────────────────────
+# ── Security helpers ─────────────────────────────────────────────────────────
+
+def resolve_safe_path(user_input):
+    """
+    Resolve a user-supplied path to an absolute, real path.
+    Rejects symlinks at the top level and ensures the path exists as a directory.
+    Returns a Path or None on failure.
+    """
+    try:
+        p = Path(user_input.strip()).expanduser()
+        p_abs = p.absolute()
+        if p_abs.is_symlink():
+            print(f"  [!] Symlink directories are not allowed: {p_abs}")
+            logging.warning(f"Rejected symlink path: {p_abs}")
+            return None
+        real = p_abs.resolve()
+        if not real.exists():
+            print(f"  [!] Directory not found: {real}")
+            return None
+        if not real.is_dir():
+            print(f"  [!] Not a directory: {real}")
+            return None
+        return real
+    except Exception as e:
+        print(f"  [!] Invalid path: {e}")
+        return None
+
+
+def is_safe_file(path):
+    """Return True only if path is a real, non-symlink file."""
+    try:
+        return path.exists() and not path.is_symlink() and path.is_file()
+    except Exception:
+        return False
+
+
+def safe_filename(name):
+    """Strip path separators and null bytes from a filename component."""
+    name = name.replace('\x00', '')
+    for ch in ('/', '\\', '..'):
+        name = name.replace(ch, '_')
+    return name.strip('. ') or '_'
+
+
+def secure_config_file(filepath):
+    """Set config file to owner-read/write only (600)."""
+    try:
+        os.chmod(filepath, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception:
+        pass
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -40,6 +92,7 @@ def load_config():
 
 def save_config(config):
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    secure_config_file(CONFIG_FILE)
 
 
 # ── Hashing ──────────────────────────────────────────────────────────────────
@@ -66,13 +119,10 @@ def get_file_hash(filepath, quick=False):
 # ── Scanning ─────────────────────────────────────────────────────────────────
 
 def scan_directory(directory):
+    """Scan recursively, skipping symlinks."""
     video_files = []
-    directory = Path(directory)
-    if not directory.exists():
-        print(f"  [!] Directory not found: {directory}")
-        return video_files
     for path in directory.rglob('*'):
-        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+        if is_safe_file(path) and path.suffix.lower() in VIDEO_EXTENSIONS:
             video_files.append(path)
     return video_files
 
@@ -106,10 +156,9 @@ def find_duplicates(files):
     return {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
 
 
-# ── TMDB API ─────────────────────────────────────────────────────────────────
+# ── TMDB API ──────────────────────────────────────────────────────────────────
 
 def tmdb_search(title, year, token):
-    """Search TMDB for a movie by title and optional year."""
     params = urllib.parse.urlencode({'query': title, 'year': year or ''})
     url = f"{TMDB_BASE}/search/movie?{params}"
     req = urllib.request.Request(url, headers={
@@ -121,34 +170,28 @@ def tmdb_search(title, year, token):
             data = json.loads(resp.read())
             results = data.get('results', [])
             if results:
-                return results[0]  # Best match
+                return results[0]
     except Exception as e:
         logging.warning(f"TMDB lookup failed for '{title}': {e}")
     return None
 
 
 def parse_filename(filename):
-    """Extract title and year from common movie filename patterns."""
     stem = Path(filename).stem
-    # Remove common quality tags
     stem = re.sub(r'\b(1080p|720p|4k|bluray|webrip|hdtv|x264|x265|hevc|aac|dts|remux)\b',
                   '', stem, flags=re.IGNORECASE)
-    # Try to find a year
     year_match = re.search(r'\b(19|20)\d{2}\b', stem)
     year = year_match.group(0) if year_match else None
     if year_match:
         stem = stem[:year_match.start()]
-    # Clean up separators
     title = re.sub(r'[._\-\[\]()]', ' ', stem).strip()
     title = re.sub(r'\s+', ' ', title).strip()
     return title, year
 
 
-# ── Organization ─────────────────────────────────────────────────────────────
+# ── Organization ──────────────────────────────────────────────────────────────
 
 def organize_movies(files, dest_dir, token):
-    """Move movies into dest_dir/Year/Title/ folders using TMDB metadata."""
-    dest_dir = Path(dest_dir)
     moved = 0
     skipped = 0
     not_found = 0
@@ -164,13 +207,20 @@ def organize_movies(files, dest_dir, token):
             movie_title = info.get('title', title)
             release = info.get('release_date', '')
             movie_year = release[:4] if release else (year or 'Unknown')
-            # Sanitize for folder name
-            safe_title = re.sub(r'[<>:"/\\|?*]', '', movie_title)
+            safe_title = re.sub(r'[<>:"/\\|?*\x00]', '', movie_title).strip('. ') or 'Unknown'
             folder = dest_dir / movie_year / safe_title
         else:
             not_found += 1
-            safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
+            safe_title = re.sub(r'[<>:"/\\|?*\x00]', '', title).strip('. ') or 'Unknown'
             folder = dest_dir / (year or 'Unknown') / safe_title
+
+        # Path traversal guard: ensure folder stays inside dest_dir
+        try:
+            folder.resolve().relative_to(dest_dir.resolve())
+        except ValueError:
+            logging.error(f"Path traversal blocked: {folder}")
+            skipped += 1
+            continue
 
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -189,16 +239,23 @@ def organize_movies(files, dest_dir, token):
     print(f"\n  ✓ Done.  Moved: {moved}  |  Skipped: {skipped}  |  Not found on TMDB: {not_found}")
 
 
-# ── Backup & Delete ──────────────────────────────────────────────────────────
+# ── Backup & Delete ───────────────────────────────────────────────────────────
 
 def backup_and_delete(file_path):
     try:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        dest = BACKUP_DIR / file_path.name
+        safe_name = safe_filename(file_path.name)
+        dest = BACKUP_DIR / safe_name
         counter = 1
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix
         while dest.exists():
-            dest = BACKUP_DIR / f"{file_path.stem}_{counter}{file_path.suffix}"
+            dest = BACKUP_DIR / f"{stem}_{counter}{suffix}"
             counter += 1
+        # Path traversal guard
+        if not str(dest.resolve()).startswith(str(BACKUP_DIR.resolve())):
+            logging.error(f"Path traversal blocked for: {file_path}")
+            return False
         shutil.move(str(file_path), str(dest))
         logging.info(f"Moved duplicate to backup: {file_path} -> {dest}")
         return True
@@ -207,7 +264,7 @@ def backup_and_delete(file_path):
         return False
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def format_size(bytes_val):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -229,7 +286,7 @@ def menu_set_token(config):
     if token:
         config['tmdb_token'] = token
         save_config(config)
-        print("  ✓ Token saved.")
+        print("  ✓ Token saved securely.")
     else:
         print("  No changes made.")
 
@@ -238,9 +295,13 @@ def menu_scan():
     print("\n─────────────────────────────────────")
     print("  SCAN FOR DUPLICATES")
     print("─────────────────────────────────────")
-    directory = input("  Enter directory to scan (e.g. C:/Users/you/Movies): ").strip()
-    if not directory:
+    raw = input("  Enter directory to scan (e.g. C:/Users/you/Movies): ").strip()
+    if not raw:
         print("  No directory entered.")
+        return None
+
+    directory = resolve_safe_path(raw)
+    if not directory:
         return None
 
     print(f"\n  Scanning '{directory}' for video files...")
@@ -313,15 +374,36 @@ def menu_organize(config):
         print("  ⚠ No TMDB token set. Movies will be organized by parsed filename only.")
         print("  (Set a token in option 5 for better results.)\n")
 
-    src = input("  Source directory (where your movies are): ").strip()
-    if not src:
+    src_raw = input("  Source directory (where your movies are): ").strip()
+    if not src_raw:
         print("  No directory entered.")
         return
 
-    dest = input("  Destination directory (where to organize them): ").strip()
-    if not dest:
+    dest_raw = input("  Destination directory (where to organize them): ").strip()
+    if not dest_raw:
         print("  No directory entered.")
         return
+
+    src = resolve_safe_path(src_raw)
+    if not src:
+        return
+
+    # Destination may not exist yet — resolve parent and recreate safely
+    dest = Path(dest_raw).expanduser().absolute()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        dest = dest.resolve()
+    except Exception as e:
+        print(f"  [!] Could not create destination: {e}")
+        return
+
+    # Prevent organizing a folder into itself or a parent
+    try:
+        src.relative_to(dest)
+        print("  [!] Source cannot be inside the destination directory.")
+        return
+    except ValueError:
+        pass
 
     files = scan_directory(src)
     if not files:
@@ -329,7 +411,9 @@ def menu_organize(config):
         return
 
     print(f"\n  Found {len(files)} video files.")
-    confirm = input("  Files will be MOVED into organized folders. Type YES to proceed: ").strip().upper()
+    print(f"  Source:      {src}")
+    print(f"  Destination: {dest}")
+    confirm = input("\n  Files will be MOVED into organized folders. Type YES to proceed: ").strip().upper()
     if confirm != 'YES':
         print("  Cancelled.")
         return
@@ -356,7 +440,7 @@ def menu_view_backup():
 def main():
     config = load_config()
     print("\n╔══════════════════════════════════════╗")
-    print("║     MOVIE DUPLICATE SCANNER  v1.0   ║")
+    print("║     MOVIE DUPLICATE SCANNER  v1.1   ║")
     print("╚══════════════════════════════════════╝")
     if not config.get('tmdb_token'):
         print("\n  Tip: Set a TMDB API token (option 5) to enable movie metadata lookup.")
